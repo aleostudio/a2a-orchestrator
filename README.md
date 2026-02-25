@@ -218,4 +218,4 @@ This project is licensed under the MIT License.
 
 ---
 
-Made with love by Alessandro Orru
+Made with ♥️ by Alessandro Orrù
