@@ -107,9 +107,21 @@ curl http://localhost:9301/health
 
 ---
 
+### `GET /ready` - Readiness check
+
+Reports if orchestrator is ready to route requests based on registry breaker state and skills cache status.
+
+```bash
+curl -i http://localhost:9301/ready
+```
+
+When not ready, returns `503 Service Unavailable`.
+
+---
+
 ### `POST /inference` - Route user request
 
-Classifies the user message, discovers an agent by skill in the registry, and delegates via A2A.
+Classifies the user message, selects a canonical `skill_id`, maps it to a registry `route_tag`, discovers an agent, and delegates via A2A.
 
 ```bash
 curl -XPOST "http://localhost:9301/inference" \

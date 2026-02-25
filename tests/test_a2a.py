@@ -33,10 +33,15 @@ def test_list_skills_extracts_tags(service, monkeypatch):
     monkeypatch.setattr(service, "list_agents", fake_list_agents)
     skills = asyncio.run(service.list_skills())
 
-    assert len(skills) == 1
-    assert skills[0]["agent"] == "General Assistant"
-    assert skills[0]["name"] == "General Knowledge"
-    assert skills[0]["tags"] == ["general", "qa"]
+    assert len(skills) == 2
+    by_tag = {entry["route_tag"]: entry for entry in skills}
+    assert "general" in by_tag
+    assert "qa" in by_tag
+    assert by_tag["general"]["skill_id"] == "general-assistant.general-knowledge.general"
+    assert by_tag["qa"]["skill_id"] == "general-assistant.general-knowledge.qa"
+    assert by_tag["general"]["agent"] == "General Assistant"
+    assert by_tag["general"]["name"] == "General Knowledge"
+    assert by_tag["general"]["tags"] == ["general", "qa"]
 
 
 def test_discover_agent_returns_first_result(service, monkeypatch):

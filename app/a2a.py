@@ -1,5 +1,6 @@
 from typing import Any
 import asyncio
+import re
 import time
 import uuid
 import httpx
@@ -7,6 +8,11 @@ from a2a.client.client_factory import ClientFactory
 from a2a.types import AgentCard, Message, Part, Role, TextPart
 from app.config import (AGENT_RETRIES, AGENT_TIMEOUT_S, CIRCUIT_FAILURE_THRESHOLD, CIRCUIT_RECOVERY_SECONDS, REGISTRY_RETRIES, REGISTRY_TIMEOUT_S, REGISTRY_URL)
 from app.logger import logger
+
+
+def _slug(value: str) -> str:
+    clean = re.sub(r"[^a-z0-9]+", "-", value.strip().lower())
+    return clean.strip("-") or "unknown"
 
 
 class CircuitBreaker:
@@ -137,18 +143,27 @@ class A2AService:
         for agent in agents:
             card = agent.get("card", {})
             agent_name = card.get("name", "unknown")
+            agent_slug = _slug(agent_name)
             for skill in card.get("skills", []):
                 tags = [str(tag).strip().lower() for tag in skill.get("tags", []) if str(tag).strip()]
                 if not tags:
                     continue
-                skills.append(
-                    {
-                        "agent": agent_name,
-                        "name": skill.get("name", "unknown"),
-                        "description": skill.get("description", ""),
-                        "tags": sorted(set(tags)),
-                    }
-                )
+                skill_name = str(skill.get("name", "unknown"))
+                skill_slug = _slug(skill_name)
+                deduped_tags = sorted(set(tags))
+                description = skill.get("description", "")
+                for tag in deduped_tags:
+                    skill_id = f"{agent_slug}.{skill_slug}.{_slug(tag)}"
+                    skills.append(
+                        {
+                            "skill_id": skill_id,
+                            "route_tag": tag,
+                            "agent": agent_name,
+                            "name": skill_name,
+                            "description": description,
+                            "tags": deduped_tags,
+                        }
+                    )
 
         return skills
 

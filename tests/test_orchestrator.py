@@ -8,9 +8,10 @@ from app import main as orchestrator
 
 @pytest.fixture(autouse=True)
 def reset_skills_prompt_cache():
-    orchestrator.skills_prompt_cache._prompt = orchestrator._build_intent_system_prompt([], "general")
-    orchestrator.skills_prompt_cache._allowed_tags = {"general"}
-    orchestrator.skills_prompt_cache._fallback_skill = "general"
+    orchestrator.skills_prompt_cache._prompt = orchestrator._build_intent_system_prompt([], "fallback.general")
+    orchestrator.skills_prompt_cache._allowed_skill_ids = {"fallback.general"}
+    orchestrator.skills_prompt_cache._fallback_skill_id = "fallback.general"
+    orchestrator.skills_prompt_cache._skill_id_to_route_tag = {"fallback.general": "general"}
     orchestrator.skills_prompt_cache._updated_at_monotonic = 0.0
     orchestrator.skills_prompt_cache._refresh_task = None
 
@@ -31,32 +32,35 @@ def test_rule_based_route_returns_none_for_non_math():
     assert orchestrator.rule_based_route("tell me about python") is None
 
 
-def test_available_skill_tags_collects_unique_tags():
-    tags = orchestrator._available_skill_tags(
+def test_available_skill_ids_collects_unique_values():
+    skill_ids = orchestrator._available_skill_ids(
         [
-            {"tags": ["general", "assistant"]},
-            {"tags": ["math", "general"]},
+            {"skill_id": "a.general.main"},
+            {"skill_id": "b.math.main"},
+            {"skill_id": "a.general.main"},
         ]
     )
-    assert tags == ["assistant", "general", "math"]
+    assert skill_ids == ["a.general.main", "b.math.main"]
 
 
 def test_build_intent_system_prompt_includes_registry_skills():
     prompt = orchestrator._build_intent_system_prompt(
         [
             {
+                "skill_id": "math-specialist.math-evaluation.math",
                 "agent": "Math Specialist",
                 "name": "Math Evaluation",
                 "description": "Evaluates arithmetic",
-                "tags": ["math", "calculator"],
+                "route_tag": "math",
             }
         ],
-        fallback_skill="math",
+        fallback_skill_id="math-specialist.math-evaluation.math",
     )
 
+    assert "skill_id" in prompt
     assert "Math Specialist" in prompt
     assert "Math Evaluation" in prompt
-    assert "math" in prompt
+    assert "route_tag: math" in prompt
 
 
 def test_select_route_uses_rule_first(monkeypatch):
@@ -75,29 +79,48 @@ def test_select_route_uses_dynamic_skills_for_llm(monkeypatch):
     async def fake_list_skills():
         return [
             {
+                "skill_id": "general-assistant.general-knowledge.general",
                 "agent": "General Assistant",
                 "name": "General Knowledge",
                 "description": "General tasks",
-                "tags": ["general", "qa"],
+                "route_tag": "general",
             }
         ]
 
     captured = {"prompt": ""}
 
-    def fake_llm(user_input: str, prompt: str, allowed_tags: set[str], fallback_skill: str, min_confidence: float):
+    def fake_llm(
+        user_input: str,
+        prompt: str,
+        allowed_skill_ids: set[str],
+        fallback_skill_id: str,
+        skill_id_to_route_tag: dict[str, str],
+        min_confidence: float,
+    ):
         captured["prompt"] = prompt
         assert user_input == "hello"
-        assert allowed_tags == {"general", "qa"}
-        assert fallback_skill == "general"
+        assert allowed_skill_ids == {"general-assistant.general-knowledge.general"}
+        assert fallback_skill_id == "general-assistant.general-knowledge.general"
+        assert skill_id_to_route_tag["general-assistant.general-knowledge.general"] == "general"
         assert min_confidence >= 0.0
-        return {"skill": "qa", "payload": "hello", "route_source": "llm"}
+        return {
+            "skill_id": "general-assistant.general-knowledge.general",
+            "skill": "general",
+            "payload": "hello",
+            "route_source": "llm",
+        }
 
     monkeypatch.setattr(orchestrator, "rule_based_route", lambda _msg: None)
     monkeypatch.setattr(orchestrator.a2a_service, "list_skills", fake_list_skills)
     monkeypatch.setattr(orchestrator, "_llm_classify_sync", fake_llm)
 
     route = asyncio.run(orchestrator.select_route("hello"))
-    assert route == {"skill": "qa", "payload": "hello", "route_source": "llm"}
+    assert route == {
+        "skill_id": "general-assistant.general-knowledge.general",
+        "skill": "general",
+        "payload": "hello",
+        "route_source": "llm",
+    }
     assert "General Knowledge" in captured["prompt"]
 
 
@@ -105,10 +128,11 @@ def test_select_route_falls_back_when_llm_fails(monkeypatch):
     async def fake_list_skills():
         return [
             {
+                "skill_id": "general-assistant.general-knowledge.general",
                 "agent": "General Assistant",
                 "name": "General Knowledge",
                 "description": "General tasks",
-                "tags": ["general"],
+                "route_tag": "general",
             }
         ]
 
@@ -120,7 +144,12 @@ def test_select_route_falls_back_when_llm_fails(monkeypatch):
     monkeypatch.setattr(orchestrator, "_llm_classify_sync", fake_llm)
 
     route = asyncio.run(orchestrator.select_route("hello world"))
-    assert route == {"skill": "general", "payload": "hello world", "route_source": "fallback"}
+    assert route == {
+        "skill_id": "general-assistant.general-knowledge.general",
+        "skill": "general",
+        "payload": "hello world",
+        "route_source": "fallback",
+    }
 
 
 def test_llm_classify_sync_applies_confidence_guardrail(monkeypatch):
@@ -133,28 +162,40 @@ def test_llm_classify_sync_applies_confidence_guardrail(monkeypatch):
     route = orchestrator._llm_classify_sync(
         user_input="hello",
         system_prompt="test",
-        allowed_tags={"general", "qa"},
-        fallback_skill="general",
+        allowed_skill_ids={"general-assistant.general-knowledge.general"},
+        fallback_skill_id="general-assistant.general-knowledge.general",
+        skill_id_to_route_tag={"general-assistant.general-knowledge.general": "general"},
         min_confidence=0.6,
     )
-    assert route == {"skill": "general", "payload": "hello", "route_source": "llm_guardrail"}
+    assert route == {
+        "skill_id": "general-assistant.general-knowledge.general",
+        "skill": "general",
+        "payload": "hello",
+        "route_source": "llm_guardrail",
+    }
 
 
 def test_llm_classify_sync_accepts_high_confidence(monkeypatch):
     class _FakeResponse:
         def __init__(self):
-            self.message = type("Msg", (), {"content": '{"skill":"qa","payload":"hello","confidence":0.95,"needs_clarification":false}'})()
+            self.message = type("Msg", (), {"content": '{"skill_id":"general-assistant.general-knowledge.general","payload":"hello","confidence":0.95,"needs_clarification":false}'})()
 
     monkeypatch.setattr(orchestrator.ollama, "chat", lambda **_kwargs: _FakeResponse())
 
     route = orchestrator._llm_classify_sync(
         user_input="hello",
         system_prompt="test",
-        allowed_tags={"general", "qa"},
-        fallback_skill="general",
+        allowed_skill_ids={"general-assistant.general-knowledge.general"},
+        fallback_skill_id="general-assistant.general-knowledge.general",
+        skill_id_to_route_tag={"general-assistant.general-knowledge.general": "general"},
         min_confidence=0.6,
     )
-    assert route == {"skill": "qa", "payload": "hello", "route_source": "llm"}
+    assert route == {
+        "skill_id": "general-assistant.general-knowledge.general",
+        "skill": "general",
+        "payload": "hello",
+        "route_source": "llm",
+    }
 
 
 def test_skills_prompt_cache_uses_ttl(monkeypatch):
@@ -162,7 +203,15 @@ def test_skills_prompt_cache_uses_ttl(monkeypatch):
 
     async def fake_list_skills():
         calls["count"] += 1
-        return [{"agent": "General Assistant", "name": "General Knowledge", "description": "", "tags": ["general"]}]
+        return [
+            {
+                "skill_id": "general-assistant.general-knowledge.general",
+                "agent": "General Assistant",
+                "name": "General Knowledge",
+                "description": "",
+                "route_tag": "general",
+            }
+        ]
 
     monkeypatch.setattr(orchestrator.a2a_service, "list_skills", fake_list_skills)
     cache = orchestrator.SkillsPromptCache(ttl_seconds=60.0, refresh_interval_seconds=30.0)
@@ -178,7 +227,15 @@ def test_skills_prompt_cache_refreshes_periodically(monkeypatch):
 
     async def fake_list_skills():
         calls["count"] += 1
-        return [{"agent": "General Assistant", "name": "General Knowledge", "description": "", "tags": ["general"]}]
+        return [
+            {
+                "skill_id": "general-assistant.general-knowledge.general",
+                "agent": "General Assistant",
+                "name": "General Knowledge",
+                "description": "",
+                "route_tag": "general",
+            }
+        ]
 
     monkeypatch.setattr(orchestrator.a2a_service, "list_skills", fake_list_skills)
     cache = orchestrator.SkillsPromptCache(ttl_seconds=60.0, refresh_interval_seconds=0.05)
@@ -211,6 +268,22 @@ def test_health_endpoint_includes_breakers(monkeypatch):
     assert body["status"] == "ok"
     assert "registry_breaker" in body
     assert "agent_breakers" in body
+
+
+def test_ready_endpoint_reports_not_ready_when_cache_empty(monkeypatch):
+    orchestrator.skills_prompt_cache._updated_at_monotonic = 0.0
+
+    async def fake_refresh(force: bool = False):
+        return None
+
+    monkeypatch.setattr(orchestrator.skills_prompt_cache, "refresh", fake_refresh)
+    client = TestClient(orchestrator.app)
+    response = client.get("/ready")
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body["status"] == "not_ready"
+    assert "skills_cache" in body
 
 
 def test_inference_returns_fallback_when_no_agent(monkeypatch):
