@@ -1,8 +1,18 @@
 import asyncio
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app import main as orchestrator
+
+
+@pytest.fixture(autouse=True)
+def reset_skills_prompt_cache():
+    orchestrator.skills_prompt_cache._prompt = orchestrator._build_intent_system_prompt([], "general")
+    orchestrator.skills_prompt_cache._allowed_tags = {"general"}
+    orchestrator.skills_prompt_cache._fallback_skill = "general"
+    orchestrator.skills_prompt_cache._updated_at_monotonic = 0.0
+    orchestrator.skills_prompt_cache._refresh_task = None
 
 
 def test_normalize_expression_converts_caret():
@@ -110,6 +120,41 @@ def test_select_route_falls_back_when_llm_fails(monkeypatch):
 
     route = asyncio.run(orchestrator.select_route("hello world"))
     assert route == {"skill": "general", "payload": "hello world", "route_source": "fallback"}
+
+
+def test_skills_prompt_cache_uses_ttl(monkeypatch):
+    calls = {"count": 0}
+
+    async def fake_list_skills():
+        calls["count"] += 1
+        return [{"agent": "General Assistant", "name": "General Knowledge", "description": "", "tags": ["general"]}]
+
+    monkeypatch.setattr(orchestrator.a2a_service, "list_skills", fake_list_skills)
+    cache = orchestrator.SkillsPromptCache(ttl_seconds=60.0, refresh_interval_seconds=30.0)
+
+    asyncio.run(cache.get_classifier_context())
+    asyncio.run(cache.get_classifier_context())
+
+    assert calls["count"] == 1
+
+
+def test_skills_prompt_cache_refreshes_periodically(monkeypatch):
+    calls = {"count": 0}
+
+    async def fake_list_skills():
+        calls["count"] += 1
+        return [{"agent": "General Assistant", "name": "General Knowledge", "description": "", "tags": ["general"]}]
+
+    monkeypatch.setattr(orchestrator.a2a_service, "list_skills", fake_list_skills)
+    cache = orchestrator.SkillsPromptCache(ttl_seconds=60.0, refresh_interval_seconds=0.05)
+
+    async def run_cycle():
+        await cache.start()
+        await asyncio.sleep(0.12)
+        await cache.stop()
+
+    asyncio.run(run_cycle())
+    assert calls["count"] >= 1
 
 
 def test_format_response_passthrough_for_general_skill():

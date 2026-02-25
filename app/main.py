@@ -1,14 +1,16 @@
 from typing import Any
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import re
+import time
 import uuid
 import ollama as ollama_client
 import uvicorn
 from fastapi import FastAPI, Request, Response
 from pydantic import BaseModel
 from app.a2a import a2a_service
-from app.config import APP_HOST, APP_NAME, APP_PORT, APP_VERSION, OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_TIMEOUT_S
+from app.config import (APP_HOST, APP_NAME, APP_PORT, APP_VERSION, OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_TIMEOUT_S, SKILLS_CACHE_REFRESH_INTERVAL_S, SKILLS_CACHE_TTL_S)
 from app.logger import logger
 
 
@@ -95,6 +97,145 @@ def _build_intent_system_prompt(registry_skills: list[dict[str, Any]], fallback_
     )
 
 
+# Keep a refreshed in-memory cache for classifier skills and prompt.
+class SkillsPromptCache:
+
+    # Initialize cache settings and default classifier context.
+    def __init__(self, ttl_seconds: float, refresh_interval_seconds: float):
+        self.ttl_seconds = max(1.0, ttl_seconds)
+        self.refresh_interval_seconds = max(0.0, refresh_interval_seconds)
+        self._lock = asyncio.Lock()
+        self._refresh_task: asyncio.Task | None = None
+        self._poller_task: asyncio.Task | None = None
+        self._startup_refresh_task: asyncio.Task | None = None
+        self._stop_event = asyncio.Event()
+        self._prompt = _build_intent_system_prompt([], "general")
+        self._allowed_tags: set[str] = {"general"}
+        self._fallback_skill = "general"
+        self._updated_at_monotonic = 0.0
+
+
+    # Return whether cache content is still valid by TTL.
+    def _is_fresh_locked(self) -> bool:
+        if self._updated_at_monotonic <= 0.0:
+            return False
+
+        return (time.monotonic() - self._updated_at_monotonic) <= self.ttl_seconds
+
+
+    # Refresh cache data by fetching skills from registry.
+    async def _refresh_once(self) -> None:
+        registry_skills = await a2a_service.list_skills()
+        available_tags = _available_skill_tags(registry_skills)
+        fallback_skill = "general"
+        if available_tags:
+            if "general" in available_tags:
+                fallback_skill = "general"
+            else:
+                fallback_skill = available_tags[0]
+        allowed_tags = set(available_tags) if available_tags else {fallback_skill}
+        prompt = _build_intent_system_prompt(registry_skills, fallback_skill)
+
+        async with self._lock:
+            self._prompt = prompt
+            self._allowed_tags = allowed_tags
+            self._fallback_skill = fallback_skill
+            self._updated_at_monotonic = time.monotonic()
+
+        logger.info(
+            "Agents skills cache refreshed: skills=%s tags=%s fallback=%s",
+            len(registry_skills),
+            len(allowed_tags),
+            fallback_skill,
+        )
+
+
+    # Refresh cache once when stale or when forced.
+    async def refresh(self, force: bool = False) -> None:
+        async with self._lock:
+            needs_refresh = force or not self._is_fresh_locked()
+            if not needs_refresh:
+                return
+            if self._refresh_task is None:
+                self._refresh_task = asyncio.create_task(self._refresh_once())
+            task = self._refresh_task
+
+        try:
+            await task
+        except Exception as exc:
+            logger.warning("skills_prompt_cache_refresh_failed err=%s", exc)
+        finally:
+            async with self._lock:
+                if self._refresh_task is task:
+                    self._refresh_task = None
+
+
+    # Return classifier context ensuring TTL-based freshness.
+    async def get_classifier_context(self) -> tuple[str, set[str], str]:
+        await self.refresh(force=False)
+        async with self._lock:
+            return self._prompt, set(self._allowed_tags), self._fallback_skill
+
+
+    # Start periodic background refresh task.
+    async def start(self) -> None:
+        if self.refresh_interval_seconds <= 0:
+            return
+        async with self._lock:
+            if self._poller_task is not None:
+                return
+            self._stop_event.clear()
+            self._poller_task = asyncio.create_task(self._poll_loop())
+
+
+    # Schedule a one-shot refresh task and keep a strong reference.
+    async def schedule_startup_refresh(self) -> None:
+        async with self._lock:
+            if self._startup_refresh_task is not None and not self._startup_refresh_task.done():
+                return
+            self._startup_refresh_task = asyncio.create_task(self.refresh(force=True))
+
+
+    # Stop periodic background refresh task.
+    async def stop(self) -> None:
+        async with self._lock:
+            task = self._poller_task
+            startup_task = self._startup_refresh_task
+            self._poller_task = None
+            self._startup_refresh_task = None
+            self._stop_event.set()
+
+        if task is not None:
+            task.cancel()
+            results = await asyncio.gather(task, return_exceptions=True)
+            error = results[0]
+            if isinstance(error, Exception) and not isinstance(error, asyncio.CancelledError):
+                logger.warning("skills_prompt_cache_poller_stop_failed err=%s", error)
+
+        if startup_task is not None:
+            startup_task.cancel()
+            results = await asyncio.gather(startup_task, return_exceptions=True)
+            error = results[0]
+            if isinstance(error, Exception) and not isinstance(error, asyncio.CancelledError):
+                logger.warning("skills_prompt_cache_startup_task_stop_failed err=%s", error)
+
+
+    # Periodically refresh cache while app is running.
+    async def _poll_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=self.refresh_interval_seconds)
+                break
+            except asyncio.TimeoutError:
+                await self.refresh(force=True)
+
+
+skills_prompt_cache = SkillsPromptCache(
+    ttl_seconds=SKILLS_CACHE_TTL_S,
+    refresh_interval_seconds=SKILLS_CACHE_REFRESH_INTERVAL_S,
+)
+
+
 # Classify intent with the configured Ollama model
 def _llm_classify_sync(user_input: str, system_prompt: str, allowed_tags: set[str], fallback_skill: str) -> dict[str, str]:
     response = ollama.chat(
@@ -123,32 +264,27 @@ def _llm_classify_sync(user_input: str, system_prompt: str, allowed_tags: set[st
 async def select_route(user_input: str) -> dict[str, str]:
     policy_result = rule_based_route(user_input)
     if policy_result:
-        logger.info("route_selected skill=%s source=rule", policy_result["skill"])
+        logger.info("Route selected: skill '%s', source 'rule'", policy_result["skill"])
         return policy_result
 
     fallback_skill = "general"
     try:
-        registry_skills = await a2a_service.list_skills()
-        available_tags = _available_skill_tags(registry_skills)
-        if available_tags:
-            fallback_skill = "general" if "general" in available_tags else available_tags[0]
-
-        system_prompt = _build_intent_system_prompt(registry_skills, fallback_skill)
+        system_prompt, allowed_tags, fallback_skill = await skills_prompt_cache.get_classifier_context()
         llm_result = await asyncio.wait_for(
             asyncio.to_thread(
                 _llm_classify_sync,
                 user_input,
                 system_prompt,
-                set(available_tags) if available_tags else {fallback_skill},
+                allowed_tags,
                 fallback_skill,
             ),
             timeout=OLLAMA_TIMEOUT_S,
         )
-        logger.info("route_selected skill=%s source=llm", llm_result["skill"])
+        logger.info("Route selected: skill '%s', source 'LLM'", llm_result["skill"])
         return llm_result
 
     except Exception as exc:
-        logger.warning("llm_classification_failed err=%s; fallback=%s", exc, fallback_skill)
+        logger.warning("LLM classification failed: err=%s; fallback=%s", exc, fallback_skill)
         return {"skill": fallback_skill, "payload": user_input, "route_source": "fallback"}
 
 
@@ -193,8 +329,19 @@ class InferenceResponse(BaseModel):
     error_code: str | None = None
 
 
+# Manage startup and shutdown resources for the API app.
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await skills_prompt_cache.start()
+    await skills_prompt_cache.schedule_startup_refresh()
+    try:
+        yield
+    finally:
+        await skills_prompt_cache.stop()
+
+
 # App init
-app = FastAPI(title=APP_NAME, version=APP_VERSION)
+app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan)
 
 
 # Expose service health and breaker snapshots
@@ -225,7 +372,7 @@ async def inference(request: InferenceRequest, req: Request, response: Response)
         )
 
     agent_name = agent_info.get("card", {}).get("name", agent_info.get("url", "unknown"))
-    logger.info("routing_to_agent name=%s url=%s skill=%s", agent_name, agent_info.get("url"), skill)
+    logger.info("Routing to agent: '%s' (%s): skill '%s'", agent_name, agent_info.get("url"), skill)
 
     result, error_code = await a2a_service.call_agent(agent_info, payload)
     if not result:

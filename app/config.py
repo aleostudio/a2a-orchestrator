@@ -16,6 +16,8 @@ DEBUG = bool(os.getenv("DEBUG", "False").lower() == "true")
 REGISTRY_URL = os.getenv("REGISTRY_URL", "http://localhost:9300")
 REGISTRY_TIMEOUT_S = float(os.getenv("REGISTRY_TIMEOUT_S", 4.0))
 REGISTRY_RETRIES = int(os.getenv("REGISTRY_RETRIES", 2))
+SKILLS_CACHE_TTL_S = float(os.getenv("SKILLS_CACHE_TTL_S", 60.0))
+SKILLS_CACHE_REFRESH_INTERVAL_S = float(os.getenv("SKILLS_CACHE_REFRESH_INTERVAL_S", 30.0))
 
 # Ollama
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
