@@ -1,0 +1,16 @@
+[project]
+name = "a2a-orchestrator"
+version = "0.1.0"
+description = "Standalone A2A Orchestrator — API gateway that classifies user intent and delegates to specialist agents via the registry"
+requires-python = ">=3.12"
+dependencies = [
+    "a2a-sdk",
+    "fastapi",
+    "uvicorn[standard]",
+    "ollama",
+    "httpx",
+    "python-dotenv",
+]
+
+[project.scripts]
+a2a-orchestrator = "app.main:main"
