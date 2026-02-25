@@ -10,7 +10,7 @@ import uvicorn
 from fastapi import FastAPI, Request, Response
 from pydantic import BaseModel
 from app.a2a import a2a_service
-from app.config import (APP_HOST, APP_NAME, APP_PORT, APP_VERSION, OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_TIMEOUT_S, SKILLS_CACHE_REFRESH_INTERVAL_S, SKILLS_CACHE_TTL_S)
+from app.config import (APP_HOST, APP_NAME, APP_PORT, APP_VERSION, OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_TIMEOUT_S, ROUTE_CONFIDENCE_THRESHOLD, SKILLS_CACHE_REFRESH_INTERVAL_S, SKILLS_CACHE_TTL_S)
 from app.logger import logger
 
 
@@ -86,15 +86,31 @@ def _build_intent_system_prompt(registry_skills: list[dict[str, Any]], fallback_
     return (
         "You are an intent classifier for an A2A orchestrator.\n"
         "Choose exactly one tag from the available tags listed below.\n"
-        "Return only valid JSON with this schema:\n"
-        '{"skill": "<one_tag>", "payload": "<text to send to the chosen agent>"}\n\n'
+        "Return only valid JSON with this exact schema:\n"
+        '{"skill": "<one_tag>", "payload": "<text to send to the chosen agent>", "confidence": <0_to_1>, "reason": "<short rationale>", "needs_clarification": <true_or_false>}\n\n'
         "Rules:\n"
         "- Use only one of the provided tags.\n"
-        "- Keep payload concise and aligned to the selected skill.\n"
-        f"- If uncertain, use fallback tag '{fallback_skill}'.\n\n"
+        "- confidence must be a float between 0 and 1.\n"
+        "- Set needs_clarification=true when the request is ambiguous, multi-intent, or missing key details.\n"
+        "- Keep payload concise and preserve user constraints and data.\n"
+        f"- If uncertain, choose fallback tag '{fallback_skill}'.\n\n"
         "Available skills from registry:\n"
         + "\n".join(skills_lines)
     )
+
+
+# Parse a float-like value with bounds fallback.
+def _coerce_confidence(raw_confidence: Any) -> float:
+    try:
+        confidence = float(raw_confidence)
+    except (TypeError, ValueError):
+        return 0.0
+
+    if confidence < 0.0:
+        return 0.0
+    if confidence > 1.0:
+        return 1.0
+    return confidence
 
 
 # Keep a refreshed in-memory cache for classifier skills and prompt.
@@ -237,7 +253,7 @@ skills_prompt_cache = SkillsPromptCache(
 
 
 # Classify intent with the configured Ollama model
-def _llm_classify_sync(user_input: str, system_prompt: str, allowed_tags: set[str], fallback_skill: str) -> dict[str, str]:
+def _llm_classify_sync(user_input: str, system_prompt: str, allowed_tags: set[str], fallback_skill: str, min_confidence: float) -> dict[str, str]:
     response = ollama.chat(
         model=OLLAMA_MODEL,
         messages=[
@@ -250,10 +266,21 @@ def _llm_classify_sync(user_input: str, system_prompt: str, allowed_tags: set[st
     data = json.loads(response.message.content)
 
     skill = str(data.get("skill", fallback_skill)).strip().lower()
-    if skill not in allowed_tags:
-        skill = fallback_skill
+    payload = str(data.get("payload") or user_input)
+    confidence = _coerce_confidence(data.get("confidence"))
+    needs_clarification = bool(data.get("needs_clarification", False))
 
-    payload = data.get("payload") or user_input
+    use_fallback = skill not in allowed_tags or confidence < min_confidence or needs_clarification
+    if use_fallback:
+        logger.info(
+            "llm_guardrail_fallback selected=%s confidence=%.2f needs_clarification=%s fallback=%s",
+            skill,
+            confidence,
+            needs_clarification,
+            fallback_skill,
+        )
+        return {"skill": fallback_skill, "payload": user_input, "route_source": "llm_guardrail"}
+
     if skill == "math":
         payload = normalize_expression(payload)
 
@@ -277,6 +304,7 @@ async def select_route(user_input: str) -> dict[str, str]:
                 system_prompt,
                 allowed_tags,
                 fallback_skill,
+                ROUTE_CONFIDENCE_THRESHOLD,
             ),
             timeout=OLLAMA_TIMEOUT_S,
         )
@@ -286,34 +314,6 @@ async def select_route(user_input: str) -> dict[str, str]:
     except Exception as exc:
         logger.warning("LLM classification failed: err=%s; fallback=%s", exc, fallback_skill)
         return {"skill": fallback_skill, "payload": user_input, "route_source": "fallback"}
-
-
-# Optionally rephrase math outputs into natural language
-def _format_response_sync(user_input: str, agent_result: str, skill: str) -> str:
-    if skill != "math":
-        return agent_result
-
-    response = ollama.chat(
-        model=OLLAMA_MODEL,
-        messages=[
-            {"role": "system", "content": "You are a helpful assistant. The user asked a math question and we computed the result. Provide a brief, natural response incorporating the result. Be concise."},
-            {"role": "user", "content": f"User asked: {user_input}\nComputed result: {agent_result}"},
-        ],
-    )
-
-    return response.message.content
-
-
-# Format final response asynchronously with safe fallback
-async def format_response(user_input: str, agent_result: str, skill: str) -> str:
-    if skill != "math":
-        return agent_result
-    try:
-        return await asyncio.wait_for(asyncio.to_thread(_format_response_sync, user_input, agent_result, skill), timeout=OLLAMA_TIMEOUT_S)
-
-    except Exception as exc:
-        logger.warning("response_formatting_failed err=%s", exc)
-        return agent_result
 
 
 # Pydantic models
@@ -385,10 +385,8 @@ async def inference(request: InferenceRequest, req: Request, response: Response)
             error_code=error_code or "agent_no_result",
         )
 
-    response_text = await format_response(request.message, result, skill)
-
     return InferenceResponse(
-        response=response_text,
+        response=result,
         agent=agent_name,
         request_id=request_id,
         status="ok",

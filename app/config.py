@@ -24,8 +24,9 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
 OLLAMA_TIMEOUT_S = float(os.getenv("OLLAMA_TIMEOUT_S", 8.0))
 
-# A2A clients health check
+# A2A
 AGENT_TIMEOUT_S = float(os.getenv("AGENT_TIMEOUT_S", 12.0))
 AGENT_RETRIES = int(os.getenv("AGENT_RETRIES", 1))
 CIRCUIT_FAILURE_THRESHOLD = int(os.getenv("CIRCUIT_FAILURE_THRESHOLD", 3))
 CIRCUIT_RECOVERY_SECONDS = int(os.getenv("CIRCUIT_RECOVERY_SECONDS", 20))
+ROUTE_CONFIDENCE_THRESHOLD = float(os.getenv("ROUTE_CONFIDENCE_THRESHOLD", 0.6))

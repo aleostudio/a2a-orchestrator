@@ -84,11 +84,12 @@ def test_select_route_uses_dynamic_skills_for_llm(monkeypatch):
 
     captured = {"prompt": ""}
 
-    def fake_llm(user_input: str, prompt: str, allowed_tags: set[str], fallback_skill: str):
+    def fake_llm(user_input: str, prompt: str, allowed_tags: set[str], fallback_skill: str, min_confidence: float):
         captured["prompt"] = prompt
         assert user_input == "hello"
         assert allowed_tags == {"general", "qa"}
         assert fallback_skill == "general"
+        assert min_confidence >= 0.0
         return {"skill": "qa", "payload": "hello", "route_source": "llm"}
 
     monkeypatch.setattr(orchestrator, "rule_based_route", lambda _msg: None)
@@ -120,6 +121,40 @@ def test_select_route_falls_back_when_llm_fails(monkeypatch):
 
     route = asyncio.run(orchestrator.select_route("hello world"))
     assert route == {"skill": "general", "payload": "hello world", "route_source": "fallback"}
+
+
+def test_llm_classify_sync_applies_confidence_guardrail(monkeypatch):
+    class _FakeResponse:
+        def __init__(self):
+            self.message = type("Msg", (), {"content": '{"skill":"qa","payload":"hello","confidence":0.2,"needs_clarification":false}'})()
+
+    monkeypatch.setattr(orchestrator.ollama, "chat", lambda **_kwargs: _FakeResponse())
+
+    route = orchestrator._llm_classify_sync(
+        user_input="hello",
+        system_prompt="test",
+        allowed_tags={"general", "qa"},
+        fallback_skill="general",
+        min_confidence=0.6,
+    )
+    assert route == {"skill": "general", "payload": "hello", "route_source": "llm_guardrail"}
+
+
+def test_llm_classify_sync_accepts_high_confidence(monkeypatch):
+    class _FakeResponse:
+        def __init__(self):
+            self.message = type("Msg", (), {"content": '{"skill":"qa","payload":"hello","confidence":0.95,"needs_clarification":false}'})()
+
+    monkeypatch.setattr(orchestrator.ollama, "chat", lambda **_kwargs: _FakeResponse())
+
+    route = orchestrator._llm_classify_sync(
+        user_input="hello",
+        system_prompt="test",
+        allowed_tags={"general", "qa"},
+        fallback_skill="general",
+        min_confidence=0.6,
+    )
+    assert route == {"skill": "qa", "payload": "hello", "route_source": "llm"}
 
 
 def test_skills_prompt_cache_uses_ttl(monkeypatch):
@@ -155,19 +190,6 @@ def test_skills_prompt_cache_refreshes_periodically(monkeypatch):
 
     asyncio.run(run_cycle())
     assert calls["count"] >= 1
-
-
-def test_format_response_passthrough_for_general_skill():
-    assert asyncio.run(orchestrator.format_response("hello", "agent output", "general")) == "agent output"
-
-
-def test_format_response_math_fallback_when_llm_fails(monkeypatch):
-    def fake_format_sync(_user_input: str, _agent_result: str, _skill: str):
-        raise RuntimeError("ollama timeout")
-
-    monkeypatch.setattr(orchestrator, "_format_response_sync", fake_format_sync)
-    result = asyncio.run(orchestrator.format_response("2+2", "4", "math"))
-    assert result == "4"
 
 
 def test_health_endpoint_includes_breakers(monkeypatch):
@@ -250,13 +272,9 @@ def test_inference_success(monkeypatch):
     async def fake_call_agent(_agent_info: dict, _payload: str):
         return "Hi from agent", None
 
-    async def fake_format_response(_user_input: str, agent_result: str, _skill: str):
-        return agent_result
-
     monkeypatch.setattr(orchestrator, "select_route", fake_select_route)
     monkeypatch.setattr(orchestrator.a2a_service, "discover_agent", fake_discover_agent)
     monkeypatch.setattr(orchestrator.a2a_service, "call_agent", fake_call_agent)
-    monkeypatch.setattr(orchestrator, "format_response", fake_format_response)
 
     client = TestClient(orchestrator.app)
     response = client.post("/inference", json={"message": "hello"})

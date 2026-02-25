@@ -51,6 +51,12 @@ Now create your `.env` file by copying:
 cp env.dist .env
 ```
 
+Optional routing tuning:
+
+- `SKILLS_CACHE_TTL_S` (default `60.0`): max age of cached skills/prompt before on-demand refresh.
+- `SKILLS_CACHE_REFRESH_INTERVAL_S` (default `30.0`): background refresh interval (`0` disables polling).
+- `ROUTE_CONFIDENCE_THRESHOLD` (default `0.6`): minimum LLM confidence required to accept non-fallback routing.
+
 [↑ index](#index)
 
 ---
