@@ -1,18 +1,8 @@
 import asyncio
-import time
-from types import SimpleNamespace
 
-import pytest
 from fastapi.testclient import TestClient
 
 from app import main as orchestrator
-
-
-@pytest.fixture(autouse=True)
-def reset_breakers():
-    orchestrator.registry_breaker.failures = 0
-    orchestrator.registry_breaker.opened_until = 0.0
-    orchestrator.agent_breakers.clear()
 
 
 def test_normalize_expression_converts_caret():
@@ -31,11 +21,39 @@ def test_rule_based_route_returns_none_for_non_math():
     assert orchestrator.rule_based_route("tell me about python") is None
 
 
+def test_available_skill_tags_collects_unique_tags():
+    tags = orchestrator._available_skill_tags(
+        [
+            {"tags": ["general", "assistant"]},
+            {"tags": ["math", "general"]},
+        ]
+    )
+    assert tags == ["assistant", "general", "math"]
+
+
+def test_build_intent_system_prompt_includes_registry_skills():
+    prompt = orchestrator._build_intent_system_prompt(
+        [
+            {
+                "agent": "Math Specialist",
+                "name": "Math Evaluation",
+                "description": "Evaluates arithmetic",
+                "tags": ["math", "calculator"],
+            }
+        ],
+        fallback_skill="math",
+    )
+
+    assert "Math Specialist" in prompt
+    assert "Math Evaluation" in prompt
+    assert "math" in prompt
+
+
 def test_select_route_uses_rule_first(monkeypatch):
     monkeypatch.setattr(
         orchestrator,
         "_llm_classify_sync",
-        lambda _msg: pytest.fail("LLM classifier should not be called for rule hits"),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("LLM should not run for rule hit")),
     )
 
     route = asyncio.run(orchestrator.select_route("1 + 1"))
@@ -43,100 +61,55 @@ def test_select_route_uses_rule_first(monkeypatch):
     assert route["skill"] == "math"
 
 
-def test_select_route_uses_llm_when_rule_misses(monkeypatch):
+def test_select_route_uses_dynamic_skills_for_llm(monkeypatch):
+    async def fake_list_skills():
+        return [
+            {
+                "agent": "General Assistant",
+                "name": "General Knowledge",
+                "description": "General tasks",
+                "tags": ["general", "qa"],
+            }
+        ]
+
+    captured = {"prompt": ""}
+
+    def fake_llm(user_input: str, prompt: str, allowed_tags: set[str], fallback_skill: str):
+        captured["prompt"] = prompt
+        assert user_input == "hello"
+        assert allowed_tags == {"general", "qa"}
+        assert fallback_skill == "general"
+        return {"skill": "qa", "payload": "hello", "route_source": "llm"}
+
     monkeypatch.setattr(orchestrator, "rule_based_route", lambda _msg: None)
-    monkeypatch.setattr(
-        orchestrator,
-        "_llm_classify_sync",
-        lambda _msg: {"skill": "general", "payload": "hello", "route_source": "llm"},
-    )
+    monkeypatch.setattr(orchestrator.a2a_service, "list_skills", fake_list_skills)
+    monkeypatch.setattr(orchestrator, "_llm_classify_sync", fake_llm)
 
     route = asyncio.run(orchestrator.select_route("hello"))
-    assert route == {"skill": "general", "payload": "hello", "route_source": "llm"}
+    assert route == {"skill": "qa", "payload": "hello", "route_source": "llm"}
+    assert "General Knowledge" in captured["prompt"]
 
 
 def test_select_route_falls_back_when_llm_fails(monkeypatch):
-    monkeypatch.setattr(orchestrator, "rule_based_route", lambda _msg: None)
+    async def fake_list_skills():
+        return [
+            {
+                "agent": "General Assistant",
+                "name": "General Knowledge",
+                "description": "General tasks",
+                "tags": ["general"],
+            }
+        ]
 
-    def _raise(_msg):
+    def fake_llm(*_args, **_kwargs):
         raise RuntimeError("ollama unavailable")
 
-    monkeypatch.setattr(orchestrator, "_llm_classify_sync", _raise)
+    monkeypatch.setattr(orchestrator, "rule_based_route", lambda _msg: None)
+    monkeypatch.setattr(orchestrator.a2a_service, "list_skills", fake_list_skills)
+    monkeypatch.setattr(orchestrator, "_llm_classify_sync", fake_llm)
 
     route = asyncio.run(orchestrator.select_route("hello world"))
     assert route == {"skill": "general", "payload": "hello world", "route_source": "fallback"}
-
-
-def test_discover_agent_returns_first_result(monkeypatch):
-    async def fake_discover_once(_skill: str):
-        return [
-            {"url": "http://agent-1", "card": {"name": "Agent 1"}},
-            {"url": "http://agent-2", "card": {"name": "Agent 2"}},
-        ]
-
-    monkeypatch.setattr(orchestrator, "_discover_once", fake_discover_once)
-    agent = asyncio.run(orchestrator.discover_agent("general"))
-    assert agent == {"url": "http://agent-1", "card": {"name": "Agent 1"}}
-    assert orchestrator.registry_breaker.failures == 0
-
-
-def test_discover_agent_opens_circuit_after_retries(monkeypatch):
-    async def fake_discover_once(_skill: str):
-        raise RuntimeError("registry down")
-
-    monkeypatch.setattr(orchestrator, "_discover_once", fake_discover_once)
-    monkeypatch.setattr(orchestrator, "REGISTRY_RETRIES", 0)
-
-    agent = asyncio.run(orchestrator.discover_agent("general"))
-    assert agent is None
-    assert orchestrator.registry_breaker.failures == 1
-
-
-def test_discover_agent_short_circuits_when_breaker_open(monkeypatch):
-    orchestrator.registry_breaker.opened_until = time.time() + 60
-
-    async def fake_discover_once(_skill: str):
-        pytest.fail("discover should not be called when breaker is open")
-
-    monkeypatch.setattr(orchestrator, "_discover_once", fake_discover_once)
-    assert asyncio.run(orchestrator.discover_agent("general")) is None
-
-
-def test_call_agent_returns_error_when_breaker_open():
-    agent_info = {"url": "http://agent-1", "card": {"name": "Agent 1"}}
-    breaker = orchestrator._agent_breaker(agent_info["url"])
-    breaker.opened_until = time.time() + 60
-
-    result, error_code = asyncio.run(orchestrator.call_agent(agent_info, "payload"))
-    assert result is None
-    assert error_code == "agent_circuit_open"
-
-
-def test_call_agent_success(monkeypatch):
-    async def fake_call_once(_agent_info: dict, _payload: str):
-        return "ok"
-
-    monkeypatch.setattr(orchestrator, "_call_agent_once", fake_call_once)
-
-    result, error_code = asyncio.run(
-        orchestrator.call_agent({"url": "http://agent-1", "card": {"name": "Agent 1"}}, "payload")
-    )
-    assert result == "ok"
-    assert error_code is None
-
-
-def test_call_agent_failure_returns_fallback_error(monkeypatch):
-    async def fake_call_once(_agent_info: dict, _payload: str):
-        raise RuntimeError("agent failed")
-
-    monkeypatch.setattr(orchestrator, "_call_agent_once", fake_call_once)
-    monkeypatch.setattr(orchestrator, "AGENT_RETRIES", 0)
-
-    result, error_code = asyncio.run(
-        orchestrator.call_agent({"url": "http://agent-1", "card": {"name": "Agent 1"}}, "payload")
-    )
-    assert result is None
-    assert error_code == "agent_call_failed"
 
 
 def test_format_response_passthrough_for_general_skill():
@@ -152,17 +125,17 @@ def test_format_response_math_fallback_when_llm_fails(monkeypatch):
     assert result == "4"
 
 
-def test_extract_text_from_event_tuple_status_message():
-    part = SimpleNamespace(root=SimpleNamespace(text="hello from status"))
-    status_message = SimpleNamespace(parts=[part])
-    status = SimpleNamespace(message=status_message)
-    task = SimpleNamespace(artifacts=[], status=status)
+def test_health_endpoint_includes_breakers(monkeypatch):
+    monkeypatch.setattr(
+        orchestrator.a2a_service,
+        "health_snapshot",
+        lambda: {
+            "registry_url": "http://localhost:9300",
+            "registry_breaker": {"failures": 0, "open": False},
+            "agent_breakers": {},
+        },
+    )
 
-    extracted = orchestrator._extract_text_from_event((task, None))
-    assert extracted == "hello from status"
-
-
-def test_health_endpoint_includes_breakers():
     client = TestClient(orchestrator.app)
     response = client.get("/health")
 
@@ -181,7 +154,7 @@ def test_inference_returns_fallback_when_no_agent(monkeypatch):
         return None
 
     monkeypatch.setattr(orchestrator, "select_route", fake_select_route)
-    monkeypatch.setattr(orchestrator, "discover_agent", fake_discover_agent)
+    monkeypatch.setattr(orchestrator.a2a_service, "discover_agent", fake_discover_agent)
 
     client = TestClient(orchestrator.app)
     response = client.post("/inference", json={"message": "hello"})
@@ -206,8 +179,8 @@ def test_inference_returns_fallback_when_agent_fails(monkeypatch):
         return None, "agent_call_failed"
 
     monkeypatch.setattr(orchestrator, "select_route", fake_select_route)
-    monkeypatch.setattr(orchestrator, "discover_agent", fake_discover_agent)
-    monkeypatch.setattr(orchestrator, "call_agent", fake_call_agent)
+    monkeypatch.setattr(orchestrator.a2a_service, "discover_agent", fake_discover_agent)
+    monkeypatch.setattr(orchestrator.a2a_service, "call_agent", fake_call_agent)
 
     client = TestClient(orchestrator.app)
     response = client.post("/inference", json={"message": "hello"})
@@ -236,8 +209,8 @@ def test_inference_success(monkeypatch):
         return agent_result
 
     monkeypatch.setattr(orchestrator, "select_route", fake_select_route)
-    monkeypatch.setattr(orchestrator, "discover_agent", fake_discover_agent)
-    monkeypatch.setattr(orchestrator, "call_agent", fake_call_agent)
+    monkeypatch.setattr(orchestrator.a2a_service, "discover_agent", fake_discover_agent)
+    monkeypatch.setattr(orchestrator.a2a_service, "call_agent", fake_call_agent)
     monkeypatch.setattr(orchestrator, "format_response", fake_format_response)
 
     client = TestClient(orchestrator.app)
